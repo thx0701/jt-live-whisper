@@ -1122,6 +1122,9 @@ def _resolve_fw_model(model_name, remote=False):
         if remote or _fw_local_cuda_ok():
             return _BREEZE_REPOS["fw_fp16"]
         return _BREEZE_REPOS["fw_int8"]
+    if model_name == "qwen3-asr":
+        # 本地補丁：qwen3-asr 僅支援離線檔案處理；誤用於即時/其他路徑時退回 large-v3-turbo
+        return "large-v3-turbo"
     return model_name
 
 
@@ -1142,6 +1145,8 @@ WHISPER_MODELS = [
     ("small", "ggml-small.bin", "快，中日文可用"),
     ("large-v3-turbo", "ggml-large-v3-turbo.bin", "快，準確度很好"),
     ("large-v3", "ggml-large-v3.bin", "最慢，中日文品質最好，有獨立 GPU 可選用"),
+    # 本地補丁：Qwen3-ASR（僅離線 --input / WebUI 檔案處理，即時走 mlx 分塊路徑）
+    ("qwen3-asr", "qwen3-asr", "Qwen3-ASR MLX，中日英名詞最準（即時+離線皆可，Apple Silicon GPU）"),
 ]
 
 # ── CPU 效能評估（自動選擇適合的 Whisper 模型）──
@@ -1179,7 +1184,8 @@ def _fw_local_cuda_ok():
 
 # mlx-community 有對應 repo 的模型（.en 系列不在其中，需退回 faster-whisper）
 _MLX_CAPABLE_MODELS = {"large-v3-turbo", "large-v3", "medium", "small", "base", "tiny",
-                       BREEZE_MODEL}
+                       BREEZE_MODEL,
+                       "qwen3-asr"}  # 本地補丁：即時+離線 Qwen3-ASR（mlx）
 
 
 def _local_asr_use_mlx(model_name, args=None):
@@ -6386,12 +6392,23 @@ def run_stream_local_whisper(capture_id: int, translator, model_name: str,
     # ── 載入 ASR 模型（mlx-whisper 或 faster-whisper）──
     fw_model = None        # faster-whisper model（use_mlx=False 時使用）
     _mlx_repo = None       # mlx-whisper HF repo（use_mlx=True 時使用）
+    _q3_rt = None          # 本地補丁：Qwen3-ASR Session（model_name == "qwen3-asr" 時使用）
     _mlx_whisper_mod = None
     _fw_model_sizes = {"large-v3-turbo": "1.6GB", "large-v3": "3.1GB",
                        "medium.en": "1.5GB", "medium": "1.5GB",
                        "small.en": "500MB", "small": "500MB",
                        "base.en": "150MB"}
-    if use_mlx:
+    if use_mlx and model_name == "qwen3-asr":
+        # 本地補丁：即時 Qwen3-ASR（mlx，模型常駐）
+        os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+        print(f"\n{C_DIM}正在載入 Qwen3-ASR 模型（1.7B-4bit，mlx GPU）...{RESET}", end="", flush=True)
+        _webui_send({"type": "progress", "stage": "載入中", "detail": "Qwen3-ASR-1.7B-4bit（mlx）"})
+        t0 = time.monotonic()
+        from mlx_qwen3_asr import Session as _Q3Session
+        _q3_rt = _Q3Session("mlx-community/Qwen3-ASR-1.7B-4bit")
+        _q3_rt.transcribe((np.zeros(1600, dtype=np.float32), 16000))  # 暖機
+        print(f" {C_OK}完成（{time.monotonic() - t0:.1f}s）{RESET}")
+    elif use_mlx:
         # 在 import 前設定，避免 huggingface_hub 的 tqdm 進度條和 "Fetching N files" 訊息
         os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
         os.environ["TQDM_DISABLE"] = "1"
@@ -6699,7 +6716,32 @@ def run_stream_local_whisper(capture_id: int, translator, model_name: str,
         t0 = time.monotonic()
         segments = []
         texts = []
-        if use_mlx:
+        if model_name == "qwen3-asr":
+            # 本地補丁：Qwen3-ASR 即時分塊辨識（模型常駐）
+            _q3_lang_map = {"zh": "zh-tw", "en": "en", "ja": "ja"}
+            _q3_ctx = {"context": meeting_topic} if meeting_topic else {}
+            _r = _q3_rt.transcribe(
+                wav_path,
+                language=_q3_lang_map.get(whisper_lang, whisper_lang),
+                **_q3_ctx)
+            text = (_r.text or "").strip()
+            # 靜音時模型可能把 context 名詞直接輸出（context echo），過濾掉
+            if text and meeting_topic:
+                _n = lambda s: re.sub(r"[\s，。、．.!?,;:'\"()]+", "", s).lower()
+                if _n(text) and _n(text) in _n(meeting_topic):
+                    text = ""
+                else:
+                    _tw = set(re.findall(r"[a-zA-Z0-9]+", text.lower()))
+                    _cw = set(re.findall(r"[a-zA-Z0-9]+", meeting_topic.lower()))
+                    if _tw and _tw.issubset(_cw):
+                        text = ""
+            for _leak in _PROMPT_LEAK_TEXTS:
+                text = text.replace(_leak, "")
+            text = text.strip("，。、 ")
+            if text:
+                segments.append({"start": 0, "end": length_ms / 1000.0, "text": text})
+                texts.append(text)
+        elif use_mlx:
             _kw = dict(
                 path_or_hf_repo=_mlx_repo,
                 language=whisper_lang,
@@ -10566,6 +10608,80 @@ def _segments_to_vtt(segments_data, vtt_path):
             f.write("\n")
 
 
+_QWEN3_ASR_REPO = "mlx-community/Qwen3-ASR-1.7B-4bit"
+
+
+def _qwen3_asr_transcribe(wav_path, lang, topic=None, progress_cb=None):
+    """本地補丁：用 mlx-qwen3-asr（Qwen3-ASR，Apple Silicon MLX）轉錄 WAV，
+    回傳與 faster-whisper 相同格式的 segments list [{"start","end","text"}]。
+    topic 會當成 --context 領域詞彙，提升專有名詞準確度。
+    progress_cb(frac) 會在辨識過程收到 0.0-1.0 的進度。"""
+    import subprocess as _sp
+    import tempfile as _tf
+    import glob as _glob
+    _lang_map = {"zh": "zh-tw", "en": "en", "ja": "ja"}
+    q_lang = _lang_map.get(lang, lang)
+    outdir = _tf.mkdtemp(prefix="qwen3asr_")
+    cmd = [os.path.join(SCRIPT_DIR, "venv", "bin", "mlx-qwen3-asr"),
+           "--model", _QWEN3_ASR_REPO, "--language", q_lang,
+           "-f", "json", "-o", outdir, wav_path]
+    if topic:
+        cmd += ["--context", topic]
+    proc = _sp.Popen(cmd, stdout=_sp.DEVNULL, stderr=_sp.PIPE, text=True)
+    err_tail = []
+    _last_pct = [-1]
+    for line in proc.stderr:
+        err_tail.append(line)
+        if len(err_tail) > 20:
+            err_tail.pop(0)
+        if not progress_cb:
+            continue
+        frac = None
+        m = re.search(r"chunk (\d+)/(\d+)(?: \(([\d.]+)%\))?", line)
+        if m:
+            cur, total = int(m.group(1)), max(int(m.group(2)), 1)
+            within = float(m.group(3) or 0) / 100.0
+            frac = min(((cur - 1) + within) / total, 1.0)
+        elif "Progress: 100.0%" in line:
+            frac = 1.0
+        if frac is not None and int(frac * 100) != _last_pct[0]:
+            _last_pct[0] = int(frac * 100)
+            try:
+                progress_cb(frac)
+            except Exception:
+                pass
+    proc.wait()
+    files = sorted(_glob.glob(os.path.join(outdir, "*.json")))
+    if proc.returncode != 0 or not files:
+        raise RuntimeError(f"mlx-qwen3-asr 失敗: {''.join(err_tail)[-300:]}")
+    with open(files[0], encoding="utf-8") as f:
+        data = json.load(f)
+    segments = []
+    for chunk in data.get("chunks", []):
+        text = (chunk.get("text") or "").strip()
+        if not text:
+            continue
+        start = float(chunk.get("start", 0))
+        end = float(chunk.get("end", 0))
+        # Qwen3-ASR 的 chunk 偏長（約 15-30 秒），依句讀切細、時間在 chunk 內按字數線性分配
+        pieces = [p.strip() for p in re.split(r"(?<=[.!?。！？])\s*", text) if p.strip()]
+        if len(pieces) > 1 and end > start:
+            total = sum(len(p) for p in pieces)
+            cur = start
+            dur = end - start
+            for p in pieces:
+                p_dur = dur * len(p) / total
+                segments.append({"start": cur, "end": cur + p_dur, "text": p})
+                cur += p_dur
+        else:
+            segments.append({"start": start, "end": end, "text": text})
+    try:
+        _sp.run(["rm", "-rf", outdir], check=False)
+    except Exception:
+        pass
+    return segments
+
+
 def process_audio_file(input_path, mode, translator, model_size="large-v3-turbo",
                        diarize=False, num_speakers=None, remote_whisper_cfg=None,
                        correct_with_llm=False, llm_model=None, llm_host=None,
@@ -10709,7 +10825,41 @@ def process_audio_file(input_path, mode, translator, model_size="large-v3-turbo"
             print(f"  {C_HIGHLIGHT}[降級] 改用本機 辨識{RESET}")
             remote_whisper_cfg = None  # fallback
 
-    if not used_remote:
+    if remote_whisper_cfg is not None and model_size == "qwen3-asr":
+        # 本地補丁：qwen3-asr 僅支援本機 MLX 辨識
+        print(f"  {C_DIM}[qwen3-asr] 僅支援本機辨識，改用本機{RESET}")
+        remote_whisper_cfg = None
+
+    if not used_remote and model_size == "qwen3-asr":
+        # 本地補丁：Qwen3-ASR（Apple Silicon MLX），中日英名詞準確度最佳
+        print(f"  {C_WHITE}載入模型    Qwen3-ASR-1.7B-4bit（mlx）...{RESET}", flush=True)
+        _webui_send({"type": "progress", "stage": "辨識中", "detail": "本機 Qwen3-ASR（mlx）"})
+        sbar = _SummaryStatusBar(model="Qwen3-ASR-1.7B-4bit", task="辨識中", asr_location="本機").start()
+        if audio_duration > 0:
+            sbar.set_progress("0%")
+        _q3_asr_t0 = time.monotonic()
+
+        def _q3_progress(frac):
+            if audio_duration > 0:
+                pos = frac * audio_duration
+                _pm, _ps = divmod(int(pos), 60)
+                _dm, _ds = divmod(int(audio_duration), 60)
+                sbar.set_progress(f"{frac:.0%}  {_pm}:{_ps:02d} / {_dm}:{_ds:02d}")
+
+        try:
+            raw_segments = _qwen3_asr_transcribe(asr_wav_path, lang, meeting_topic,
+                                                 progress_cb=_q3_progress)
+        except Exception as e:
+            sbar.set_task("Qwen3-ASR 辨識失敗", reset_timer=False)
+            sbar.freeze()
+            sbar.stop()
+            print(f"  {C_HIGHLIGHT}[錯誤] Qwen3-ASR 辨識失敗: {e}{RESET}", file=sys.stderr)
+            return None, None, None
+        sbar.set_progress("")
+        sbar.set_task(f"辨識完成（{len(raw_segments)} 段，{time.monotonic() - _q3_asr_t0:.1f}s）",
+                      reset_timer=False)
+
+    if not used_remote and model_size != "qwen3-asr":
         # 本機 faster-whisper
         try:
             from faster_whisper import WhisperModel
