@@ -381,11 +381,12 @@ def _get_config():
                 port = cfg.get("llm_port", 11434) or cfg.get("ollama_port", 11434)
                 llm_host = f"{llm_host}:{port}"
             llm_model = cfg.get("last_llm_model", "") or cfg.get("ollama_model", llm_model)
-            # 使用者自訂翻譯模型
+            # 使用者自訂翻譯模型（本地補丁：支援 {"name","label"} friendly 顯示名）
             for um in cfg.get("translate_models", []):
                 name = um if isinstance(um, str) else um.get("name", "")
+                label = name if isinstance(um, str) else (um.get("label") or name)
                 if name and not any(m["value"] == name for m in llm_models):
-                    llm_models.append({"value": name, "label": name})
+                    llm_models.append({"value": name, "label": label})
         except Exception:
             pass
     # 前次使用的設定（webui 自己存的）
@@ -870,6 +871,9 @@ async def api_test_llm(body: dict = {}):
                         continue
                     models = [m.get("id", "") for m in data["data"] if m.get("id")]
                     server_type = "openai"
+                # 本地補丁：過濾 ASR 模型——mlx_lm.server 0.31+ 會把 HF cache 全模型
+                # 列進 /v1/models（含 Qwen3-ASR 等），選到必 404（2026-10-17 事故）
+                models = [m for m in models if "asr" not in m.lower()]
                 return JSONResponse({"ok": True, "server_type": server_type,
                                      "models": models[:20], "url": url})
         except Exception:
@@ -896,6 +900,15 @@ def _build_args(body: dict) -> list:
         if engine == "llm":
             llm_model = body.get("llm_model", "")
             llm_host = body.get("llm_host", "")
+            # 模型→主機綁定：特定模型有固定後端，避免主機欄填錯
+            # （Hy-MT2 走本機 mlx_lm.server :8931）
+            if "hy-mt" in llm_model.lower():
+                llm_host = "localhost:8931"
+            # 本地補丁：Index-Translate——9B 走 Ollama（官方 GGUF，名稱不帶路徑、
+            # 主機照使用者選的 11434）；MLX 本地版（路徑開頭 /）才綁 mlx_lm.server
+            # 2B → 8933（LaunchAgent 預設停用，測評用）
+            if "index-translate" in llm_model.lower() and llm_model.startswith("/"):
+                llm_host = "localhost:8933" if "-2b" in llm_model.lower() else "localhost:8932"
             if llm_model:
                 args.extend(["--llm-model", llm_model])
             if llm_host:
@@ -909,6 +922,8 @@ def _build_args(body: dict) -> list:
         args.append("--mic")
     if body.get("denoise"):
         args.append("--denoise")
+    if body.get("spk_split"):
+        args.append("--spk-split")
     if body.get("diarize"):
         args.append("--diarize")
         num_spk = body.get("num_speakers")

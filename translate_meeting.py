@@ -1122,8 +1122,8 @@ def _resolve_fw_model(model_name, remote=False):
         if remote or _fw_local_cuda_ok():
             return _BREEZE_REPOS["fw_fp16"]
         return _BREEZE_REPOS["fw_int8"]
-    if model_name == "qwen3-asr":
-        # 本地補丁：qwen3-asr 僅支援離線檔案處理；誤用於即時/其他路徑時退回 large-v3-turbo
+    if model_name in ("qwen3-asr", "qwen3-asr-0.6b", "nemotron-asr"):
+        # 本地補丁：qwen3-asr/nemotron-asr 走自有路徑；誤用於 faster-whisper 時退回 large-v3-turbo
         return "large-v3-turbo"
     return model_name
 
@@ -1145,8 +1145,11 @@ WHISPER_MODELS = [
     ("small", "ggml-small.bin", "快，中日文可用"),
     ("large-v3-turbo", "ggml-large-v3-turbo.bin", "快，準確度很好"),
     ("large-v3", "ggml-large-v3.bin", "最慢，中日文品質最好，有獨立 GPU 可選用"),
-    # 本地補丁：Qwen3-ASR（僅離線 --input / WebUI 檔案處理，即時走 mlx 分塊路徑）
+    # 本地補丁：Qwen3-ASR（即時走 mlx 串流/分塊路徑，離線走檔案處理）
     ("qwen3-asr", "qwen3-asr", "Qwen3-ASR MLX，中日英名詞最準（即時+離線皆可，Apple Silicon GPU）"),
+    ("qwen3-asr-0.6b", "qwen3-asr-0.6b", "Qwen3-ASR 0.6B MLX，更輕更快的選項（即時+離線，Apple Silicon GPU）"),
+    # 本地補丁：NVIDIA Nemotron-3.5-ASR（mlx-audio 串流，RTF~0.04 速度最快）
+    ("nemotron-asr", "nemotron-asr", "Nemotron-3.5-ASR 串流 MLX，速度最快（即時+離線；40 語含 zh-TW/ja，名詞與數字格式弱於 Qwen3-ASR）"),
 ]
 
 # ── CPU 效能評估（自動選擇適合的 Whisper 模型）──
@@ -2776,13 +2779,24 @@ class OllamaTranslator:
             print(f"{C_DIM}正在連接 {srv_label} ({model})...{RESET}", end=" ", flush=True)
             _webui_send({"type": "progress", "stage": "載入中", "detail": f"連接 {srv_label}（{model}）"})
             try:
-                self._call_ollama("hello", [])
+                # 部分模型（如 Hy-MT2）的 chat template 要求「指令\n\n正文」雙段結構，
+                # 單行探測文字會讓模板切分越界，補 \n\n 以相容
+                self._call_ollama("連線測試\n\nhello", [])
                 print(f"{C_OK}{BOLD}完成！{RESET}")
             except Exception as e:
                 print(f"\n[錯誤] 無法連接 {srv_label}: {e}", file=sys.stderr)
                 sys.exit(1)
 
     def _build_prompt(self, text, context):
+        # 本地補丁：Index-Translate 用官方短 prompt——長角色 prompt 實測會漂移
+        # （出現簡體「线程」與「洳漏」錯字），官方格式輸出乾淨且最快
+        if "index-translate" in str(self.model).lower():
+            _tgt_map = {"zh": "Traditional Chinese (Taiwan)",
+                        "en": "English", "ja": "Japanese"}
+            _tgt = _tgt_map.get(self.direction.split("2")[-1])
+            if _tgt:
+                return (f"Translate the following segment into {_tgt}, "
+                        f"without additional explanation.\n\n{text}")
         _dispatch = {"zh2en": self._build_prompt_zh2en,
                      "ja2zh": self._build_prompt_ja2zh,
                      "zh2ja": self._build_prompt_zh2ja,
@@ -2969,7 +2983,13 @@ class OllamaTranslator:
         if not text:
             return ""
         try:
-            result = self._call_ollama(text, self.context)
+            # 專職 MT 模型（如 Hy-MT2）面對多段上下文 prompt 會複誦上一句翻譯，
+            # 此類模型不帶上下文、逐句獨立翻譯反而正確
+            # 本地補丁：Index-Translate 同為專職 MT，比照辦理
+            _is_mt_only = any(k in str(self.model).lower()
+                              for k in ("hy-mt", "index-translate"))
+            _ctx = [] if _is_mt_only else self.context
+            result = self._call_ollama(text, _ctx)
             # 移除 <think>...</think> 標籤（部分模型如 Qwen3 會自動思考）
             result = re.sub(r'<think>[\s\S]*?</think>', '', result).strip()
             # 移除未閉合的 <think>（模型可能只輸出開頭）
@@ -3297,8 +3317,10 @@ def _llm_generate(prompt, model, host, port, server_type, stream=False,
             "messages": [{"role": "user", "content": prompt}],
             "stream": stream,
         }
-        # OpenAI 相容：部分伺服器支援 chat_template_kwargs 關閉思考
-        if think is False:
+        # OpenAI 相容：部分伺服器支援 chat_template_kwargs 關閉思考。
+        # 僅思考型模型需要；mlx_lm.server 0.31.3 實測支援此參數
+        # 本地補丁：Index-Translate（Qwen3.5 基底）預設開思考，必須關閉否則延遲爆炸
+        if think is False and ("qwen" in model.lower() or "index-translate" in model.lower()):
             payload["chat_template_kwargs"] = {"enable_thinking": False}
     else:
         # 預設 Ollama
@@ -3333,7 +3355,9 @@ def _llm_generate(prompt, model, host, port, server_type, stream=False,
         with _open() as resp:
             result = json.loads(resp.read())
             if server_type == "openai":
-                return result["choices"][0]["message"]["content"].strip()
+                # 本地補丁：Hy-MT2 等模型的輸出在 reasoning 欄，content 空時退回
+                _msg = result["choices"][0]["message"]
+                return (_msg.get("content") or _msg.get("reasoning") or "").strip()
             else:
                 return result["response"].strip()
 
@@ -6359,6 +6383,698 @@ def run_stream_remote(capture_id: int, translator, model_name: str,
     clear_status_bar()
     restore_terminal()
     _cleanup_remote()
+
+
+def _nemotron_asr_transcribe(wav_path, whisper_lang):
+    """本地補丁：Nemotron-3.5-ASR 離線轉錄（bin/nemotron_stream.py --file，跑在
+    mlx-latest venv 的 mlx-audio）。RTF 約 0.04（3 分鐘片約 8 秒）。
+    模型不產生時間戳：句子切分後依總時長線性分配（同 qwen3 長 chunk 做法）。"""
+    import subprocess as _sp
+    import wave as _wave
+    _helper = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "bin", "nemotron_stream.py")
+    _nemo_py = os.environ.get("NEMOTRON_RT_PYTHON",
+                              "/Users/user/venvs/mlx-latest/bin/python")
+    _lang_map = {"zh": "zh-TW", "en": "en-US", "ja": "ja-JP"}
+    _n_lang = _lang_map.get(whisper_lang, "auto")
+    _proc = _sp.run([_nemo_py, _helper, "--file", str(wav_path),
+                     "--lang", _n_lang],
+                    capture_output=True, text=True, timeout=1800)
+    if _proc.returncode != 0:
+        raise RuntimeError(f"(exit {_proc.returncode}) {_proc.stderr.strip()[-300:]}")
+    _text = ""
+    for _line in _proc.stdout.splitlines():
+        _line = _line.strip()
+        if _line.startswith("{"):
+            try:
+                _j = json.loads(_line)
+                if "text" in _j:
+                    _text = _j["text"].strip()
+                    break
+            except Exception:
+                pass
+    if not _text:
+        return []
+    _dur = 0.0
+    try:
+        with _wave.open(str(wav_path)) as _w:
+            _dur = _w.getnframes() / max(_w.getframerate(), 1)
+    except Exception:
+        pass
+    if _dur <= 0:
+        return [{"start": 0.0, "end": 1.0, "text": _text}]
+    _pieces = [p.strip() for p in re.split(r"(?<=[.!?。！？])\s*", _text) if p.strip()]
+    if not _pieces:
+        return [{"start": 0.0, "end": _dur, "text": _text}]
+    _total = sum(len(p) for p in _pieces)
+    _segments = []
+    _cur = 0.0
+    for _p in _pieces:
+        _share = len(_p) / _total * _dur
+        _segments.append({"start": round(_cur, 2),
+                          "end": round(min(_cur + _share, _dur), 2),
+                          "text": _p})
+        _cur += _share
+    return _segments
+
+
+def run_stream_qwen3_streaming(capture_id: int, translator, mode: str = "en2zh",
+                               meeting_topic: str = None, asr_model: str = "qwen3-asr"):
+    """本地補丁：Qwen3-ASR 真串流即時引擎（KV-cache，音訊邊到邊轉）。
+    取代固定視窗等待：句子定稿（約 0.3-0.9s）即送翻譯，端到端延遲約 1.2-1.5s。
+    串流模式參考 mlx-qwen3-asr cli.py --mic 迴圈（MIT）。
+    環境變數 QWEN3_RT_MODEL 可換 ASR 模型（預設 1.7B-4bit，運算吃緊可改
+    mlx-community/Qwen3-ASR-0.6B-4bit）。注意：此引擎不吃 --denoise/--record。"""
+    import queue as _queue_mod
+    import numpy as np
+    from mlx_qwen3_asr import streaming as _q3_streaming
+
+    whisper_lang = _mode_whisper_lang(mode)
+    _q3_lang_map = {"zh": "zh-tw", "en": "en", "ja": "ja"}
+    q_lang = _q3_lang_map.get(whisper_lang, whisper_lang)
+    need_translate = mode in _TRANSLATE_MODES
+
+    # ── 翻譯記錄檔 ──
+    from datetime import datetime
+    log_prefixes = {"en2zh": "英翻中_逐字稿", "zh2en": "中翻英_逐字稿",
+                    "ja2zh": "日翻中_逐字稿", "zh2ja": "中翻日_逐字稿",
+                    "en": "英文_逐字稿", "zh": "中文_逐字稿", "ja": "日文_逐字稿"}
+    log_prefix = log_prefixes.get(mode, "逐字稿")
+    topic_part = _topic_to_filename_part(meeting_topic)
+    log_filename = datetime.now().strftime(f"{log_prefix}{topic_part}_%Y%m%d_%H%M%S.txt")
+    os.makedirs(LOG_DIR, exist_ok=True)
+    log_path = os.path.join(LOG_DIR, log_filename)
+
+    print_lock = threading.Lock()
+    src_color, src_label, dst_color, dst_label = _MODE_LABELS[mode]
+
+    # ── 載入串流引擎 ──
+    print(f"\n{C_DIM}正在載入 Qwen3-ASR 串流引擎（mlx GPU）...{RESET}", end="", flush=True)
+    _webui_send({"type": "progress", "stage": "載入中", "detail": "Qwen3-ASR 串流引擎"})
+    t0 = time.monotonic()
+    # 串流 ASR：1.7B-4bit 句子完整度最好（0.6B 實測碎片化嚴重，短碎片送翻譯
+    # 會讓翻譯模型輸出 prompt 規則文字）；要極速可設
+    # QWEN3_RT_MODEL=mlx-community/Qwen3-ASR-0.6B-4bit 自行評估
+    _rt_default = ("mlx-community/Qwen3-ASR-0.6B-4bit"
+                   if "0.6" in asr_model else _QWEN3_ASR_REPO)
+    _rt_model = _qwen3_local_snapshot(
+        os.environ.get("QWEN3_RT_MODEL", _rt_default))
+    state = _q3_streaming.init_streaming(
+        model=_rt_model, language=q_lang,
+        context=meeting_topic or "",
+        chunk_size_sec=2.0,
+        max_context_sec=12.0,  # 限制跨講者污染範圍
+        endpointing_mode="energy",
+        finalization_mode="latency")
+    # 真正預載入：餵足 chunk 長度的靜音觸發權重載入 + Metal kernel 編譯，
+    # 開始監聽後第一句話不用等載模型
+    state = _q3_streaming.feed_audio(
+        np.zeros(16000 * 3, dtype=np.float32), state)
+    print(f" {C_OK}完成（{time.monotonic() - t0:.1f}s）{RESET}", flush=True)
+    print(f"  {C_DIM}串流模式：句子定稿即翻譯，無視窗等待（Ctrl+C 停止）{RESET}", flush=True)
+
+    # 背景預熱翻譯 LLM
+    if need_translate and translator and hasattr(translator, "warmup"):
+        threading.Thread(target=translator.warmup, daemon=True).start()
+
+    # ── 擷音 → 佇列（音訊執行緒不做推論）──
+    stop_event = threading.Event()
+    import sounddevice as sd
+    sd_samplerate, sd_channels = _capture_stream_info(capture_id)
+    audio_q = _queue_mod.Queue()
+
+    _sr_gcd = None
+    if sd_samplerate != 16000:
+        from math import gcd as _gcd
+        from scipy.signal import resample_poly as _resample_poly
+        _g = _gcd(int(sd_samplerate), 16000)
+        _up, _down = 16000 // _g, int(sd_samplerate) // _g
+
+    def audio_callback(indata, frames, time_info, status):
+        if stop_event.is_set():
+            return
+        audio = indata.astype(np.float32)
+        if audio.ndim > 1 and audio.shape[1] > 1:
+            audio = audio.mean(axis=1)
+        else:
+            audio = audio.flatten()
+        if sd_samplerate != 16000:
+            audio = _resample_poly(audio, _up, _down).astype(np.float32)
+        audio_q.put(audio)
+
+    # ── 翻譯有序輸出（同 run_stream_local_whisper 模式）──
+    _trans_seq = [0]
+    _trans_pending = {}
+    _trans_next = [0]
+    _trans_lock = threading.Lock()
+
+    def _drain_translations(_log_path):
+        while True:
+            with _trans_lock:
+                entry = _trans_pending.pop(_trans_next[0], None)
+                if entry is None:
+                    break
+                _trans_next[0] += 1
+            src_text, result, elapsed, asr_elapsed = entry
+            if not result:
+                continue
+            # 翻譯規則洩漏過濾：垃圾輸入會讓翻譯模型輸出 prompt 規則文字，直接丟棄
+            if "軟體、網路、記憶體" in result or "使用台灣用語" in result:
+                continue
+            with print_lock:
+                _print_with_badge(f"{src_color}[{src_label}] {src_text}{RESET}",
+                                  C_BADGE_ASR, asr_elapsed, "辨")
+                _print_with_badge(f"{dst_color}{BOLD}[{dst_label}] {result}{RESET}",
+                                  _speed_badge_color(elapsed), elapsed, "譯")
+                print(flush=True)
+            timestamp = time.strftime("%H:%M:%S")
+            with open(_log_path, "a", encoding="utf-8") as log_f:
+                log_f.write(f"[{timestamp}] [{src_label}] {src_text}\n")
+                log_f.write(f"[{timestamp}] [{dst_label}] {result}\n\n")
+            _webui_send({"type": "transcription", "source": "main",
+                         "src_lang": src_label, "src_text": src_text,
+                         "dst_lang": dst_label, "dst_text": result,
+                         "asr_time": round(asr_elapsed, 1),
+                         "translate_time": round(elapsed, 1),
+                         "timestamp": timestamp})
+
+    def translate_and_print(seq, src_text, _log_path, asr_elapsed=0):
+        t_start = time.monotonic()
+        result = translator.translate(src_text)
+        elapsed = time.monotonic() - t_start
+        if result:
+            result = S2TWP.convert(result) if not isinstance(translator, OllamaTranslator) else _to_traditional(result)
+        with _trans_lock:
+            _trans_pending[seq] = (src_text, result, elapsed, asr_elapsed)
+        _drain_translations(_log_path)
+
+    # ── stable 增量處理 ──
+    _PROMPT_LEAK_TEXTS = {"以下是繁體中文語音內容", "請使用繁體中文輸出", "請使用繁體中文",
+                          "以下是繁体中文语音内容", "请使用繁体中文输出", "请使用繁体中文",
+                          "以下は日本語の音声です"}
+    if mode in _EN_INPUT_MODES:
+        hallucination_check = _is_en_hallucination
+    elif mode in _JA_INPUT_MODES:
+        hallucination_check = _is_ja_hallucination
+    else:
+        hallucination_check = _is_zh_hallucination
+
+    _emitted = [""]
+    _recent_lines = deque(maxlen=8)  # 重複修剪：最近已送出的句子（標點正規化後比對）
+    _frag_buf = [""]  # 碎片緩衝：太短的定稿先暫存，與下一段合併再送翻譯
+
+    def _emit_stable_delta(asr_elapsed):
+        nonlocal state
+        stable = state.stable_text
+        if not stable or len(stable) <= len(_emitted[0]):
+            return
+        text = stable[len(_emitted[0]):].strip()
+        _emitted[0] = stable
+        if _frag_buf[0]:
+            text = (_frag_buf[0] + " " + text).strip()
+            _frag_buf[0] = ""
+        for _leak in _PROMPT_LEAK_TEXTS:
+            text = text.replace(_leak, "")
+        # 靜音 context echo 過濾（同分塊引擎）
+        if text and meeting_topic:
+            _n = lambda s: re.sub(r"[\s，。、．.!?,;:'\"()]+", "", s).lower()
+            if _n(text) and _n(text) in _n(meeting_topic):
+                return
+            _tw = set(re.findall(r"[a-zA-Z0-9]+", text.lower()))
+            _cw = set(re.findall(r"[a-zA-Z0-9]+", meeting_topic.lower()))
+            if _tw and _tw.issubset(_cw):
+                return
+        text = text.strip("，。、 ")
+        if not text or hallucination_check(text):
+            return
+        # 碎片緩衝：少於 3 個詞且未斷句的定稿先暫存，避免短碎片單獨送翻譯
+        # （翻譯模型對無意義短片段會輸出 prompt 規則文字）
+        _word_count = len(re.findall(r"[A-Za-z0-9\u4e00-\u9fff]+", text))
+        _ends_sentence = bool(re.search(r"[.!?。！？]$", text))
+        if _word_count < 3 and not _ends_sentence:
+            _frag_buf[0] = text
+            return
+        # 重複修剪：串流定稿的重疊重述以句子級去重（標點正規化後 containment 比對）
+        # 注意中日文無空格，斷句用 \s*（\s+ 會切不開導致重複句漏網）
+        _pieces = [p.strip() for p in re.split(r"(?<=[.!?。！？])\s*", text) if p.strip()]
+        _norm = lambda s: re.sub(r"[.。!！?？,，、\s]+", "", s.lower())
+        # context echo 過濾（piece 級）：小模型帶 topic 時會把名詞表整段吐出來，
+        # 8 成以上詞彙來自 topic 的句子視為 echo 丟棄
+        _ctx_tokens = set(re.findall(r"[a-zA-Z0-9\u4e00-\u9fff]+", (meeting_topic or "").lower()))
+        def _is_ctx_echo(p):
+            toks = re.findall(r"[a-zA-Z0-9\u4e00-\u9fff]+", p.lower())
+            if not toks or not _ctx_tokens or len(toks) < 3:
+                return False
+            _hit = sum(1 for t in toks if t in _ctx_tokens)
+            return _hit / len(toks) >= 0.8
+        _pieces = [p for p in _pieces if not _is_ctx_echo(p)]
+        # 只丟「新句是舊句子集」的純重複；「新句包含舊句+新內容」必須保留
+        # （反向 containment 會把串流重聽產生的「舊句+新尾巴」整句吃掉）
+        _new_pieces = [p for p in _pieces
+                       if not any(_norm(p) in q for q in _recent_lines)]
+        if not _new_pieces:
+            return
+        # 防重複死循環：同一批定稿內出現大量重複（≥4 句相同）= ASR 上下文已污染，
+        # 捨棄本批並重置串流狀態（清掉被污染的 context）
+        from collections import Counter as _Counter
+        _norms = [_norm(p) for p in _new_pieces]
+        if len(_norms) >= 4 and _Counter(_norms).most_common(1)[0][1] >= 4:
+            print(f"{C_DIM}  [串流] 偵測到重複死循環，重置辨識上下文{RESET}", flush=True)
+            try:
+                state = _q3_streaming.init_streaming(
+                    model=_rt_model, language=q_lang,
+                    context=meeting_topic or "",
+                    chunk_size_sec=2.0,
+                    endpointing_mode="energy",
+                    finalization_mode="latency")
+            except Exception:
+                pass
+            return
+        text = " ".join(_new_pieces)
+        for _p in _new_pieces:
+            _recent_lines.append(_norm(_p))
+        # 保護翻譯端：過長的定稿（重複殘渣）只送最後 200 字，避免翻譯模型超時/唸規則
+        if len(text) > 200:
+            text = text[-200:].strip()
+        if mode in _ZH_INPUT_MODES:
+            text = S2TWP.convert(text)
+        if need_translate and translator:
+            seq = _trans_seq[0]
+            _trans_seq[0] += 1
+            threading.Thread(target=translate_and_print,
+                             args=(seq, text, log_path, asr_elapsed),
+                             daemon=True).start()
+        else:
+            with print_lock:
+                print(f"{src_color}[{src_label}] {text}{RESET}", flush=True)
+                print(flush=True)
+            timestamp = time.strftime("%H:%M:%S")
+            with open(log_path, "a", encoding="utf-8") as log_f:
+                log_f.write(f"[{timestamp}] [{src_label}] {text}\n\n")
+            _webui_send({"type": "transcription", "source": "main",
+                         "src_lang": src_label, "src_text": text,
+                         "dst_lang": "", "dst_text": "",
+                         "timestamp": timestamp})
+
+    # ── 講者切換偵測（resemblyzer 跑獨立執行緒，不阻塞 ASR 饋入）──
+    # 換人講話時串流 ASR 會把兩人黏成一句，這裡偵測切換並強制斷句+重置上下文。
+    # 預設關閉（隔離變數用），要啟用設 QWEN3_SPK_SPLIT=1
+    _spk_event = threading.Event()
+    _spk_win = deque(maxlen=32000)  # 最近 2 秒 16kHz 音訊
+    _spk_enabled = os.environ.get("QWEN3_SPK_SPLIT", "0") == "1"
+
+    def _speaker_monitor():
+        if not _spk_enabled:
+            return
+        try:
+            from resemblyzer import VoiceEncoder
+            _enc = VoiceEncoder()
+            _ref = None
+        except Exception:
+            return
+        _low = 0            # 連續低相似度計數（兩次才確認，防單點抖動）
+        _cooldown_until = 0.0  # 重置後冷卻，防連續誤判抽搐
+        while not stop_event.is_set():
+            time.sleep(1.2)
+            _now = time.monotonic()
+            if _now < _cooldown_until:
+                continue
+            if len(_spk_win) < 24000:  # 不足 1.5 秒
+                continue
+            _w = np.array(_spk_win, dtype=np.float32)
+            if float(np.sqrt(np.mean(_w ** 2))) < 0.008:  # 靜音略過
+                continue
+            try:
+                _e = _enc.embed_utterance(_w)
+            except Exception:
+                continue
+            _e = _e / (np.linalg.norm(_e) + 1e-9)
+            if _ref is None:
+                _ref = _e
+                continue
+            _sim = float(np.dot(_ref, _e))
+            if _sim < 0.68:
+                _low += 1
+                if _low >= 2:  # 連續兩次低相似才確認講者切換
+                    _spk_event.set()
+                    _ref = _e
+                    _low = 0
+                    _cooldown_until = _now + 4.0
+            else:
+                _low = 0
+                _ref = 0.7 * _ref + 0.3 * _e  # 緩慢追蹤同一講者的變化
+
+    def _worker():
+        nonlocal state
+        while not stop_event.is_set():
+            try:
+                chunk = audio_q.get(timeout=0.3)
+            except _queue_mod.Empty:
+                continue
+            if len(chunk) < 400:
+                _spk_win.extend(chunk.tolist() if hasattr(chunk, "tolist") else chunk)
+                continue
+            if _spk_event.is_set():
+                # 講者切換：沖出目前定稿並重置串流上下文（斷開兩人的話）
+                _spk_event.clear()
+                try:
+                    state = _q3_streaming.finish_streaming(state)
+                    _emit_stable_delta(0.0)
+                except Exception:
+                    pass
+                state = _q3_streaming.init_streaming(
+                    model=_rt_model, language=q_lang,
+                    context=meeting_topic or "",
+                    chunk_size_sec=2.0,
+                    max_context_sec=12.0,
+                    endpointing_mode="energy",
+                    finalization_mode="latency")
+                _emitted[0] = ""
+                print(f"{C_DIM}  [串流] 偵測到講者切換，已斷句{RESET}", flush=True)
+                continue
+            _spk_win.extend(chunk.tolist() if hasattr(chunk, "tolist") else chunk)
+            t_clock = time.monotonic()
+            state = _q3_streaming.feed_audio(chunk, state)
+            _emit_stable_delta(time.monotonic() - t_clock)
+
+    # ── 啟動 ──
+    sd_stream = _open_capture_stream(
+        capture_id, audio_callback, sd_samplerate, sd_channels,
+        blocksize=int(sd_samplerate * 0.1))
+    sd_stream.start()
+    worker_thread = threading.Thread(target=_worker, daemon=True)
+    worker_thread.start()
+    if _spk_enabled:
+        threading.Thread(target=_speaker_monitor, daemon=True).start()
+    print(f"  {C_OK}開始監聽...（真串流：原文 partial 隨講隨轉，定稿即送翻譯）{RESET}", flush=True)
+
+    try:
+        while True:
+            time.sleep(0.2)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop_event.set()
+        try:
+            sd_stream.stop()
+            sd_stream.close()
+        except Exception:
+            pass
+        try:
+            state = _q3_streaming.finish_streaming(state)
+            _emit_stable_delta(0.0)  # 收尾：沖出最後未定稿的殘留
+        except Exception:
+            pass
+        print(f"\n{C_DIM}已停止。記錄檔：{os.path.relpath(log_path)}{RESET}")
+
+
+def run_stream_nemotron_streaming(capture_id: int, translator, mode: str = "en2zh",
+                                  meeting_topic: str = None,
+                                  asr_model: str = "nemotron-asr"):
+    """本地補丁：NVIDIA Nemotron-3.5-ASR 真串流引擎（mlx-audio，子進程橋接）。
+    RNNT append-only 定稿增量：無 LLM 式重複/context 汙染問題，句子切分靠標點
+    （模型自帶標點與大小寫）。速度極快（RTF~0.04）；技術名詞與數字格式弱於
+    Qwen3-ASR（如 ST-Link→Street Link、STM32→thirty two），速記場景適用。
+    look-ahead 由 NEMOTRON_RT_DELAY 控制（80/160/560/1120ms，預設 560 平衡檔）。
+    模型在子進程（~/venvs/mlx-latest）載入，不汙染本 venv 的 mlx 版本。
+    注意：此引擎不吃 --denoise/--record/--spk-split。"""
+    import queue as _queue_mod
+    import numpy as np
+    import subprocess as _sp
+
+    whisper_lang = _mode_whisper_lang(mode)
+    _nemo_lang_map = {"zh": "zh-TW", "en": "en-US", "ja": "ja-JP"}
+    n_lang = _nemo_lang_map.get(whisper_lang)
+    need_translate = mode in _TRANSLATE_MODES
+
+    # ── 翻譯記錄檔 ──
+    from datetime import datetime
+    log_prefixes = {"en2zh": "英翻中_逐字稿", "zh2en": "中翻英_逐字稿",
+                    "ja2zh": "日翻中_逐字稿", "zh2ja": "中翻日_逐字稿",
+                    "en": "英文_逐字稿", "zh": "中文_逐字稿", "ja": "日文_逐字稿"}
+    log_prefix = log_prefixes.get(mode, "逐字稿")
+    topic_part = _topic_to_filename_part(meeting_topic)
+    log_filename = datetime.now().strftime(f"{log_prefix}{topic_part}_%Y%m%d_%H%M%S.txt")
+    os.makedirs(LOG_DIR, exist_ok=True)
+    log_path = os.path.join(LOG_DIR, log_filename)
+
+    print_lock = threading.Lock()
+    src_color, src_label, dst_color, dst_label = _MODE_LABELS[mode]
+
+    # ── 啟動子進程橋接器（模型在子進程載入，ready 後才開始監聽）──
+    print(f"\n{C_DIM}正在載入 Nemotron-3.5-ASR 串流引擎（mlx-audio，子進程）...{RESET}",
+          end="", flush=True)
+    _webui_send({"type": "progress", "stage": "載入中", "detail": "Nemotron-3.5-ASR 串流引擎"})
+    t0 = time.monotonic()
+    _helper = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "bin", "nemotron_stream.py")
+    _nemo_py = os.environ.get("NEMOTRON_RT_PYTHON",
+                              "/Users/user/venvs/mlx-latest/bin/python")
+    _nemo_args = [_nemo_py, _helper]
+    if n_lang:
+        _nemo_args += ["--lang", n_lang]
+    proc = _sp.Popen(_nemo_args, stdin=_sp.PIPE, stdout=_sp.PIPE,
+                     stderr=None, bufsize=0)
+    _ready = False
+    _deadline = time.monotonic() + 90
+    while time.monotonic() < _deadline:
+        _line = proc.stdout.readline()
+        if not _line:
+            break
+        try:
+            if json.loads(_line).get("ready"):
+                _ready = True
+                break
+        except Exception:
+            pass
+    if not _ready:
+        proc.kill()
+        print(f" {C_HIGHLIGHT}失敗（子進程未就緒）{RESET}", flush=True)
+        return
+    print(f" {C_OK}完成（{time.monotonic() - t0:.1f}s，lang={n_lang or 'auto'}）{RESET}", flush=True)
+    print(f"  {C_DIM}串流模式：RNNT 定稿增量，句讀切分即送翻譯（Ctrl+C 停止）{RESET}", flush=True)
+
+    # 背景預熱翻譯 LLM
+    if need_translate and translator and hasattr(translator, "warmup"):
+        threading.Thread(target=translator.warmup, daemon=True).start()
+
+    # ── 擷音 → 佇列（音訊執行緒不做推論/寫管線）──
+    stop_event = threading.Event()
+    import sounddevice as sd
+    sd_samplerate, sd_channels = _capture_stream_info(capture_id)
+    audio_q = _queue_mod.Queue()
+
+    _sr_gcd = None
+    if sd_samplerate != 16000:
+        from math import gcd as _gcd
+        from scipy.signal import resample_poly as _resample_poly
+        _g = _gcd(int(sd_samplerate), 16000)
+        _up, _down = 16000 // _g, int(sd_samplerate) // _g
+
+    def audio_callback(indata, frames, time_info, status):
+        if stop_event.is_set():
+            return
+        audio = indata.astype(np.float32)
+        if audio.ndim > 1 and audio.shape[1] > 1:
+            audio = audio.mean(axis=1)
+        else:
+            audio = audio.flatten()
+        if sd_samplerate != 16000:
+            audio = _resample_poly(audio, _up, _down).astype(np.float32)
+        audio_q.put(audio)
+
+    # ── 翻譯有序輸出（同 qwen3 引擎模式）──
+    # 並發上限＝1：mlx_lm.server 對不同 prompt 的並發請求有超線性懲罰
+    # （實測串流中單發 0.8s，3 並發各 7-9s，KV cache 互踩），客戶端序列化
+    # 讓爆發句依 0.8s/1.6s/2.4s 節奏出清；有序輸出機制本來就不依賴完成順序
+    _trans_slots = threading.Semaphore(1)
+    _trans_seq = [0]
+    _trans_pending = {}
+    _trans_next = [0]
+    _trans_lock = threading.Lock()
+
+    def _drain_translations(_log_path):
+        while True:
+            with _trans_lock:
+                entry = _trans_pending.pop(_trans_next[0], None)
+                if entry is None:
+                    break
+                _trans_next[0] += 1
+            src_text, result, elapsed, asr_elapsed = entry
+            if not result:
+                continue
+            if "軟體、網路、記憶體" in result or "使用台灣用語" in result:
+                continue
+            with print_lock:
+                _print_with_badge(f"{src_color}[{src_label}] {src_text}{RESET}",
+                                  C_BADGE_ASR, asr_elapsed, "辨")
+                _print_with_badge(f"{dst_color}{BOLD}[{dst_label}] {result}{RESET}",
+                                  _speed_badge_color(elapsed), elapsed, "譯")
+                print(flush=True)
+            timestamp = time.strftime("%H:%M:%S")
+            with open(_log_path, "a", encoding="utf-8") as log_f:
+                log_f.write(f"[{timestamp}] [{src_label}] {src_text}\n")
+                log_f.write(f"[{timestamp}] [{dst_label}] {result}\n\n")
+            _webui_send({"type": "transcription", "source": "main",
+                         "src_lang": src_label, "src_text": src_text,
+                         "dst_lang": dst_label, "dst_text": result,
+                         "asr_time": round(asr_elapsed, 1),
+                         "translate_time": round(elapsed, 1),
+                         "timestamp": timestamp})
+
+    def translate_and_print(seq, src_text, _log_path, asr_elapsed=0):
+        with _trans_slots:
+            t_start = time.monotonic()
+            result = translator.translate(src_text)
+            elapsed = time.monotonic() - t_start
+        if result:
+            result = S2TWP.convert(result) if not isinstance(translator, OllamaTranslator) else _to_traditional(result)
+        with _trans_lock:
+            _trans_pending[seq] = (src_text, result, elapsed, asr_elapsed)
+        _drain_translations(_log_path)
+
+    # ── 定稿增量 → 句子緩衝（RNNT 增量不回頭改，靠句讀切分）──
+    if mode in _EN_INPUT_MODES:
+        hallucination_check = _is_en_hallucination
+    elif mode in _JA_INPUT_MODES:
+        hallucination_check = _is_ja_hallucination
+    else:
+        hallucination_check = _is_zh_hallucination
+
+    _acc = [""]        # 未定稿句的累積文字
+    _acc_t0 = [0.0]    # 本句第一個 delta 到達時刻（算「辨」延遲用）
+    _frag_buf = [""]   # 碎片緩衝：太短未斷句先併入下一句
+
+    def _emit_sentence(text, asr_elapsed):
+        text = text.strip("，。、 \t")
+        if not text or hallucination_check(text):
+            return
+        _word_count = len(re.findall(r"[A-Za-z0-9\u4e00-\u9fff]+", text))
+        _ends_sentence = bool(re.search(r"[.!?。！？]$", text))
+        if _word_count < 3 and not _ends_sentence:
+            _frag_buf[0] = text
+            return
+        if _frag_buf[0]:
+            text = (_frag_buf[0] + " " + text).strip()
+            _frag_buf[0] = ""
+        # 過長保護：只送尾部 200 字
+        if len(text) > 200:
+            text = text[-200:].strip()
+        # zh 輸入（zh-TW 模型）仍可能滲簡體，統一台灣正體
+        if mode in _ZH_INPUT_MODES:
+            text = S2TWP.convert(text)
+        if need_translate and translator:
+            seq = _trans_seq[0]
+            _trans_seq[0] += 1
+            threading.Thread(target=translate_and_print,
+                             args=(seq, text, log_path, asr_elapsed),
+                             daemon=True).start()
+        else:
+            with print_lock:
+                print(f"{src_color}[{src_label}] {text}{RESET}", flush=True)
+                print(flush=True)
+            timestamp = time.strftime("%H:%M:%S")
+            with open(log_path, "a", encoding="utf-8") as log_f:
+                log_f.write(f"[{timestamp}] [{src_label}] {text}\n\n")
+            _webui_send({"type": "transcription", "source": "main",
+                         "src_lang": src_label, "src_text": text,
+                         "dst_lang": "", "dst_text": "",
+                         "timestamp": timestamp})
+
+    def _flush_accumulated(asr_elapsed):
+        # 有句讀的完整句全部送出；殘留未斷句文字留待合併
+        _cur = _acc[0].strip()
+        if not _cur:
+            return
+        _pieces = [p.strip() for p in re.split(r"(?<=[.!?。！？])\s*", _cur) if p.strip()]
+        if not _pieces:
+            return
+        _complete = _pieces[:-1]
+        _tail = _pieces[-1]
+        _ends = bool(re.search(r"[.!?。！？]$", _cur))
+        if _ends:
+            _complete = _pieces
+            _tail = ""
+        for _p in _complete:
+            _emit_sentence(_p, asr_elapsed)
+        _acc[0] = _tail
+        if not _tail:
+            _acc_t0[0] = 0.0
+
+    def _reader():
+        while True:
+            _line = proc.stdout.readline()
+            if not _line:
+                break
+            try:
+                _j = json.loads(_line)
+            except Exception:
+                continue
+            _d = _j.get("delta")
+            if not _d:
+                continue
+            _now = time.monotonic()
+            if not _acc[0]:
+                _acc_t0[0] = _now
+            _acc[0] += _d
+            _asr_elapsed = _now - _acc_t0[0]
+            # 句讀出現 → 切分送出；或無標點硬撐到 120 字（中日文長句保護）
+            if re.search(r"[.!?。！？]\s*$", _acc[0].strip()) or len(_acc[0]) >= 120:
+                _flush_accumulated(_asr_elapsed)
+
+    reader_thread = threading.Thread(target=_reader, daemon=True)
+
+    def _worker():
+        while not stop_event.is_set():
+            try:
+                chunk = audio_q.get(timeout=0.3)
+            except _queue_mod.Empty:
+                continue
+            try:
+                _pcm = (np.clip(chunk, -1.0, 1.0) * 32767.0).astype(np.int16).tobytes()
+                proc.stdin.write(_pcm)
+                proc.stdin.flush()
+            except (BrokenPipeError, ValueError, OSError):
+                stop_event.set()
+                return
+
+    # ── 啟動 ──
+    sd_stream = _open_capture_stream(
+        capture_id, audio_callback, sd_samplerate, sd_channels,
+        blocksize=int(sd_samplerate * 0.1))
+    sd_stream.start()
+    reader_thread.start()
+    worker_thread = threading.Thread(target=_worker, daemon=True)
+    worker_thread.start()
+    print(f"  {C_OK}開始監聽...（Nemotron 串流：RNNT 定稿增量，句讀切分即送翻譯）{RESET}", flush=True)
+
+    try:
+        while True:
+            time.sleep(0.2)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop_event.set()
+        try:
+            sd_stream.stop()
+            sd_stream.close()
+        except Exception:
+            pass
+        try:
+            proc.stdin.close()
+        except Exception:
+            pass
+        # 沖出殘留：子進程收到 EOF 後輸出 eof 前的最後增量
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            proc.kill()
+        if _acc[0].strip():
+            _flush_accumulated(0.0)
+            if _acc[0].strip():
+                _emit_sentence(_acc[0], 0.0)
+                _acc[0] = ""
+        print(f"\n{C_DIM}已停止。記錄檔：{os.path.relpath(log_path)}{RESET}")
 
 
 def run_stream_local_whisper(capture_id: int, translator, model_name: str,
@@ -10825,12 +11541,12 @@ def process_audio_file(input_path, mode, translator, model_size="large-v3-turbo"
             print(f"  {C_HIGHLIGHT}[降級] 改用本機 辨識{RESET}")
             remote_whisper_cfg = None  # fallback
 
-    if remote_whisper_cfg is not None and model_size == "qwen3-asr":
-        # 本地補丁：qwen3-asr 僅支援本機 MLX 辨識
-        print(f"  {C_DIM}[qwen3-asr] 僅支援本機辨識，改用本機{RESET}")
+    if remote_whisper_cfg is not None and model_size in ("qwen3-asr", "qwen3-asr-0.6b", "nemotron-asr"):
+        # 本地補丁：qwen3-asr/nemotron-asr 僅支援本機 MLX 辨識
+        print(f"  {C_DIM}[ASR] 此模型僅支援本機辨識，改用本機{RESET}")
         remote_whisper_cfg = None
 
-    if not used_remote and model_size == "qwen3-asr":
+    if not used_remote and model_size in ("qwen3-asr", "qwen3-asr-0.6b"):
         # 本地補丁：Qwen3-ASR（Apple Silicon MLX），中日英名詞準確度最佳
         print(f"  {C_WHITE}載入模型    Qwen3-ASR-1.7B-4bit（mlx）...{RESET}", flush=True)
         _webui_send({"type": "progress", "stage": "辨識中", "detail": "本機 Qwen3-ASR（mlx）"})
@@ -10859,7 +11575,28 @@ def process_audio_file(input_path, mode, translator, model_size="large-v3-turbo"
         sbar.set_task(f"辨識完成（{len(raw_segments)} 段，{time.monotonic() - _q3_asr_t0:.1f}s）",
                       reset_timer=False)
 
-    if not used_remote and model_size != "qwen3-asr":
+    if not used_remote and model_size == "nemotron-asr":
+        # 本地補丁：Nemotron-3.5-ASR（mlx-audio 子進程，速度最快 RTF~0.04）
+        print(f"  {C_WHITE}載入模型    Nemotron-3.5-ASR-0.6B-8bit（mlx-audio）...{RESET}", flush=True)
+        _webui_send({"type": "progress", "stage": "辨識中", "detail": "本機 Nemotron-3.5-ASR（mlx）"})
+        sbar = _SummaryStatusBar(model="Nemotron-3.5-ASR-0.6B", task="辨識中", asr_location="本機").start()
+        if audio_duration > 0:
+            sbar.set_progress("0%")
+        _nemo_t0 = time.monotonic()
+        try:
+            raw_segments = _nemotron_asr_transcribe(asr_wav_path, lang)
+        except Exception as e:
+            sbar.set_task("Nemotron-ASR 辨識失敗", reset_timer=False)
+            sbar.freeze()
+            sbar.stop()
+            print(f"  {C_HIGHLIGHT}[錯誤] Nemotron-ASR 辨識失敗: {e}{RESET}", file=sys.stderr)
+            return None, None, None
+        sbar.set_progress("")
+        sbar.set_task(f"辨識完成（{len(raw_segments)} 段，{time.monotonic() - _nemo_t0:.1f}s）",
+                      reset_timer=False)
+
+    # 本地補丁：qwen3 系與 nemotron 已在上面各自處理完，勿再落進 faster-whisper
+    if not used_remote and model_size not in ("qwen3-asr", "qwen3-asr-0.6b", "nemotron-asr"):
         # 本機 faster-whisper
         try:
             from faster_whisper import WhisperModel
@@ -13458,6 +14195,10 @@ def parse_args():
         "--denoise", action="store_true",
         help="即時模式啟用背景降噪（noisereduce spectral gating，推薦搭配麥克風使用）")
     parser.add_argument(
+        # 本地補丁：講者切換偵測（qwen3 串流引擎，等效 QWEN3_SPK_SPLIT=1）
+        "--spk-split", action="store_true",
+        help="即時 qwen3 串流啟用講者切換偵測（resemblyzer，斷句+重置上下文）")
+    parser.add_argument(
         "--local-asr", action="store_true",
         help="強制使用本機 辨識（忽略GPU 伺服器 設定，即時模式與離線模式皆適用）")
     parser.add_argument(
@@ -14890,6 +15631,19 @@ def main():
                                              denoise=args.denoise,
                                              mic_remote_cfg=_mic_remote)
                     sys.exit(0)
+            # 本地補丁：qwen3-asr 即時走真串流引擎（無視窗等待）
+            if getattr(args, "spk_split", False):
+                os.environ["QWEN3_SPK_SPLIT"] = "1"
+            if (model_name in ("qwen3-asr", "qwen3-asr-0.6b") and not args.mic
+                    and _local_asr_use_mlx(model_name, args)):
+                run_stream_qwen3_streaming(capture_id, translator, mode,
+                                           meeting_topic=meeting_topic, asr_model=model_name)
+                sys.exit(0)
+            # 本地補丁：nemotron-asr 即時走 mlx-audio 串流引擎（子進程）
+            if model_name == "nemotron-asr" and not args.mic:
+                run_stream_nemotron_streaming(capture_id, translator, mode,
+                                              meeting_topic=meeting_topic, asr_model=model_name)
+                sys.exit(0)
             if _cli_use_local_fw:
                 run_stream_local_whisper(capture_id, translator, model_name, mode,
                                         length_ms=length_ms, step_ms=step_ms,
@@ -15224,6 +15978,17 @@ def main():
                                    llm_host=f"{host}:{port}" if _need_llm else None,
                                    denoise=args.denoise)
                     if not _confirm_start(_build_cli_command(**_cli_kw)):
+                        sys.exit(0)
+                    # 本地補丁：qwen3-asr 即時走真串流引擎（無視窗等待）
+                    if (model_name in ("qwen3-asr", "qwen3-asr-0.6b") and not getattr(args, "mic", False)
+                            and _local_asr_use_mlx(model_name, args)):
+                        run_stream_qwen3_streaming(capture_id, translator, mode,
+                                                   meeting_topic=meeting_topic, asr_model=model_name)
+                        sys.exit(0)
+                    # 本地補丁：nemotron-asr 即時走 mlx-audio 串流引擎（子進程）
+                    if model_name == "nemotron-asr" and not getattr(args, "mic", False):
+                        run_stream_nemotron_streaming(capture_id, translator, mode,
+                                                      meeting_topic=meeting_topic, asr_model=model_name)
                         sys.exit(0)
                     run_stream_local_whisper(capture_id, translator, model_name, mode,
                                             length_ms=length_ms, step_ms=step_ms,
