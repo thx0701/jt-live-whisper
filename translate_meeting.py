@@ -1188,7 +1188,8 @@ def _fw_local_cuda_ok():
 # mlx-community 有對應 repo 的模型（.en 系列不在其中，需退回 faster-whisper）
 _MLX_CAPABLE_MODELS = {"large-v3-turbo", "large-v3", "medium", "small", "base", "tiny",
                        BREEZE_MODEL,
-                       "qwen3-asr"}  # 本地補丁：即時+離線 Qwen3-ASR（mlx）
+                       # 本地補丁：即時+離線 Qwen3-ASR（mlx）
+                       "qwen3-asr", "qwen3-asr-0.6b"}
 
 
 def _local_asr_use_mlx(model_name, args=None):
@@ -11325,6 +11326,27 @@ def _segments_to_vtt(segments_data, vtt_path):
 
 
 _QWEN3_ASR_REPO = "mlx-community/Qwen3-ASR-1.7B-4bit"
+
+
+def _qwen3_local_snapshot(repo):
+    """本地補丁：優先回傳 HF 本地快取路徑，避免 hub 限速時退避重試卡死。
+    快取若缺 .gitattributes/README 等非推論檔，新版 hub 會拋
+    IncompleteSnapshotError，改手動回 snapshots 目錄。"""
+    try:
+        from huggingface_hub import snapshot_download
+        return snapshot_download(repo_id=repo, local_files_only=True)
+    except Exception:
+        pass
+    try:
+        import glob as _glob
+        _base = os.path.expanduser(
+            f"~/.cache/huggingface/hub/models--{repo.replace('/', '--')}/snapshots/*")
+        _dirs = sorted(_glob.glob(_base))
+        if _dirs:
+            return _dirs[-1]
+    except Exception:
+        pass
+    return repo
 
 
 def _qwen3_asr_transcribe(wav_path, lang, topic=None, progress_cb=None):
