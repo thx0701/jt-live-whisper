@@ -6650,6 +6650,10 @@ def run_stream_qwen3_streaming(capture_id: int, translator, mode: str = "en2zh",
                     finalization_mode="latency")
             except Exception:
                 pass
+            # 本地補丁（2026-10-23 修）：重置後 stable_text 從零開始，
+            # _emitted/_frag_buf 未清空會壓制所有後續輸出（引擎假死）
+            _emitted[0] = ""
+            _frag_buf[0] = ""
             return
         text = " ".join(_new_pieces)
         for _p in _new_pieces:
@@ -6732,31 +6736,49 @@ def run_stream_qwen3_streaming(capture_id: int, translator, mode: str = "en2zh",
                 chunk = audio_q.get(timeout=0.3)
             except _queue_mod.Empty:
                 continue
-            if len(chunk) < 400:
+            # 本地補丁（2026-10-23 修）：worker 是 daemon 執行緒，任何未捕捉
+            # 例外都會無聲殺死它（音訊繼續收、永遠沒人處理＝假死）。
+            # 改為捕捉後重置串流狀態續跑。
+            try:
+                if len(chunk) < 400:
+                    _spk_win.extend(chunk.tolist() if hasattr(chunk, "tolist") else chunk)
+                    continue
+                if _spk_event.is_set():
+                    # 講者切換：沖出目前定稿並重置串流上下文（斷開兩人的話）
+                    _spk_event.clear()
+                    try:
+                        state = _q3_streaming.finish_streaming(state)
+                        _emit_stable_delta(0.0)
+                    except Exception:
+                        pass
+                    state = _q3_streaming.init_streaming(
+                        model=_rt_model, language=q_lang,
+                        context=meeting_topic or "",
+                        chunk_size_sec=2.0,
+                        max_context_sec=12.0,
+                        endpointing_mode="energy",
+                        finalization_mode="latency")
+                    _emitted[0] = ""
+                    print(f"{C_DIM}  [串流] 偵測到講者切換，已斷句{RESET}", flush=True)
+                    continue
                 _spk_win.extend(chunk.tolist() if hasattr(chunk, "tolist") else chunk)
-                continue
-            if _spk_event.is_set():
-                # 講者切換：沖出目前定稿並重置串流上下文（斷開兩人的話）
-                _spk_event.clear()
+                t_clock = time.monotonic()
+                state = _q3_streaming.feed_audio(chunk, state)
+                _emit_stable_delta(time.monotonic() - t_clock)
+            except Exception as _feed_err:
+                print(f"{C_DIM}  [串流] 饋入異常，重置串流狀態: {_feed_err}{RESET}",
+                      flush=True)
                 try:
-                    state = _q3_streaming.finish_streaming(state)
-                    _emit_stable_delta(0.0)
+                    state = _q3_streaming.init_streaming(
+                        model=_rt_model, language=q_lang,
+                        context=meeting_topic or "",
+                        chunk_size_sec=2.0,
+                        endpointing_mode="energy",
+                        finalization_mode="latency")
                 except Exception:
                     pass
-                state = _q3_streaming.init_streaming(
-                    model=_rt_model, language=q_lang,
-                    context=meeting_topic or "",
-                    chunk_size_sec=2.0,
-                    max_context_sec=12.0,
-                    endpointing_mode="energy",
-                    finalization_mode="latency")
                 _emitted[0] = ""
-                print(f"{C_DIM}  [串流] 偵測到講者切換，已斷句{RESET}", flush=True)
-                continue
-            _spk_win.extend(chunk.tolist() if hasattr(chunk, "tolist") else chunk)
-            t_clock = time.monotonic()
-            state = _q3_streaming.feed_audio(chunk, state)
-            _emit_stable_delta(time.monotonic() - t_clock)
+                _frag_buf[0] = ""
 
     # ── 啟動 ──
     sd_stream = _open_capture_stream(
