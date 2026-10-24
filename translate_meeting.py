@@ -6583,6 +6583,8 @@ def run_stream_qwen3_streaming(capture_id: int, translator, mode: str = "en2zh",
     _emitted = [""]
     _recent_lines = deque(maxlen=8)  # 重複修剪：最近已送出的句子（標點正規化後比對）
     _frag_buf = [""]  # 碎片緩衝：太短的定稿先暫存，與下一段合併再送翻譯
+    _frag_last_t = [0.0]  # 本地補丁（2026-10-24 修二）：碎片最後更新時刻（定時沖出用）
+    _last_reset_t = [0.0]  # 本地補丁（2026-10-24 修三）：上次死循環重置時刻（防振盪）
 
     def _emit_stable_delta(asr_elapsed):
         nonlocal state
@@ -6594,6 +6596,11 @@ def run_stream_qwen3_streaming(capture_id: int, translator, mode: str = "en2zh",
         if _frag_buf[0]:
             text = (_frag_buf[0] + " " + text).strip()
             _frag_buf[0] = ""
+        _process_text(text, asr_elapsed)
+
+    def _process_text(text, asr_elapsed):
+        # 本地補丁（2026-10-24 修二）：從 _emit_stable_delta 抽出的過濾+切分+送出段，
+        # 讓逾時沖出的碎片也走完整過濾鏈（echo/幻覺/去重），不繞過防護
         for _leak in _PROMPT_LEAK_TEXTS:
             text = text.replace(_leak, "")
         # 靜音 context echo 過濾（同分塊引擎）
@@ -6618,7 +6625,11 @@ def run_stream_qwen3_streaming(capture_id: int, translator, mode: str = "en2zh",
         # 改為：句中已含句讀 → 切出前段完整句送出，只留無句讀的尾巴暫存
         _has_inner_stop = bool(re.search(r"[.!?。！？]", text[:-1]))
         if _word_count < 3 and not _ends_sentence and not _has_inner_stop:
-            _frag_buf[0] = text
+            # 本地補丁（2026-10-24 修二）：附加而非覆寫——連續碎片會互相蓋掉，
+            # 且 stable 不再增長時無人來合併＝永久積壓（第二次日文場假死根因）
+            _frag_buf[0] = ((_frag_buf[0] + " " + text).strip()
+                            if _frag_buf[0] else text)
+            _frag_last_t[0] = time.monotonic()
             return
         # 重複修剪：串流定稿的重疊重述以句子級去重（標點正規化後 containment 比對）
         # 注意中日文無空格，斷句用 \s*（\s+ 會切不開導致重複句漏網）
@@ -6645,6 +6656,29 @@ def run_stream_qwen3_streaming(capture_id: int, translator, mode: str = "en2zh",
         from collections import Counter as _Counter
         _norms = [_norm(p) for p in _new_pieces]
         if len(_norms) >= 4 and _Counter(_norms).most_common(1)[0][1] >= 4:
+            # 本地補丁（2026-10-24 修三）：10 秒內連續重置＝重置無效（內容本身
+            # 高度重複，如音樂/口頭禪），改為跳過去重直接送出本批，防振盪
+            _now = time.monotonic()
+            if _now - _last_reset_t[0] < 10.0:
+                print(f"{C_DIM}  [串流] 重置無效，本批直接送出（內容高度重複）{RESET}", flush=True)
+                text = " ".join(_new_pieces[:2])
+                for _p in _new_pieces[:2]:
+                    _recent_lines.append(_norm(_p))
+                if len(text) > 200:
+                    text = text[-200:].strip()
+                if mode in _ZH_INPUT_MODES:
+                    text = S2TWP.convert(text)
+                if need_translate and translator:
+                    seq = _trans_seq[0]
+                    _trans_seq[0] += 1
+                    threading.Thread(target=translate_and_print,
+                                     args=(seq, text, log_path, asr_elapsed),
+                                     daemon=True).start()
+                else:
+                    with print_lock:
+                        print(f"{src_color}[{src_label}] {text}{RESET}", flush=True)
+                return
+            _last_reset_t[0] = _now
             print(f"{C_DIM}  [串流] 偵測到重複死循環，重置辨識上下文{RESET}", flush=True)
             try:
                 state = _q3_streaming.init_streaming(
@@ -6659,6 +6693,11 @@ def run_stream_qwen3_streaming(capture_id: int, translator, mode: str = "en2zh",
             # _emitted/_frag_buf 未清空會壓制所有後續輸出（引擎假死）
             _emitted[0] = ""
             _frag_buf[0] = ""
+            _frag_last_t[0] = 0.0
+            # 本地補丁（2026-10-24 修三）：_recent_lines 也要清——重置後 ASR 重聽
+            # 同段內容，舊去重清單會把重聽句全部丟棄 → 又觸發重置 → 無限循環
+            # （第二次日文場「連續重置不復原」的根因）
+            _recent_lines.clear()
             return
         text = " ".join(_new_pieces)
         for _p in _new_pieces:
@@ -6770,6 +6809,14 @@ def run_stream_qwen3_streaming(capture_id: int, translator, mode: str = "en2zh",
                 t_clock = time.monotonic()
                 state = _q3_streaming.feed_audio(chunk, state)
                 _emit_stable_delta(time.monotonic() - t_clock)
+                # 本地補丁（2026-10-24 修二）：定時沖出——stable 停止增長後
+                # 碎片緩衝無人合併會永久積壓；逾時直接以現有內容送翻譯
+                if (_frag_buf[0] and _frag_last_t[0]
+                        and time.monotonic() - _frag_last_t[0] > 2.5):
+                    _frag, _frag_buf[0] = _frag_buf[0], ""
+                    _frag_last_t[0] = 0.0
+                    if _frag.strip("，。、 "):
+                        _process_text(_frag, 0.0)
             except Exception as _feed_err:
                 print(f"{C_DIM}  [串流] 饋入異常，重置串流狀態: {_feed_err}{RESET}",
                       flush=True)
@@ -6972,6 +7019,7 @@ def run_stream_nemotron_streaming(capture_id: int, translator, mode: str = "en2z
     _acc = [""]        # 未定稿句的累積文字
     _acc_t0 = [0.0]    # 本句第一個 delta 到達時刻（算「辨」延遲用）
     _frag_buf = [""]   # 碎片緩衝：太短未斷句先併入下一句
+    _frag_last_t = [0.0]  # 本地補丁（2026-10-24 修二）：碎片最後更新時刻
 
     def _emit_sentence(text, asr_elapsed):
         text = text.strip("，。、 \t")
@@ -6983,7 +7031,10 @@ def run_stream_nemotron_streaming(capture_id: int, translator, mode: str = "en2z
         # 必須放行切分，否則中日文碎片永遠積壓在緩衝裡
         _has_inner_stop = bool(re.search(r"[.!?。！？]", text[:-1]))
         if _word_count < 3 and not _ends_sentence and not _has_inner_stop:
-            _frag_buf[0] = text
+            # 本地補丁（2026-10-24 修二）：附加而非覆寫（同 qwen3 引擎）
+            _frag_buf[0] = ((_frag_buf[0] + " " + text).strip()
+                            if _frag_buf[0] else text)
+            _frag_last_t[0] = time.monotonic()
             return
         if _frag_buf[0]:
             text = (_frag_buf[0] + " " + text).strip()
