@@ -6585,6 +6585,7 @@ def run_stream_qwen3_streaming(capture_id: int, translator, mode: str = "en2zh",
     _frag_buf = [""]  # 碎片緩衝：太短的定稿先暫存，與下一段合併再送翻譯
     _frag_last_t = [0.0]  # 本地補丁（2026-10-24 修二）：碎片最後更新時刻（定時沖出用）
     _last_reset_t = [0.0]  # 本地補丁（2026-10-24 修三）：上次死循環重置時刻（防振盪）
+    _need_reset = [False]  # 本地補丁（2026-10-24 修四）：重置請求標誌（跨閉包傳遞）
 
     def _emit_stable_delta(asr_elapsed):
         nonlocal state
@@ -6598,9 +6599,11 @@ def run_stream_qwen3_streaming(capture_id: int, translator, mode: str = "en2zh",
             _frag_buf[0] = ""
         _process_text(text, asr_elapsed)
 
-    def _process_text(text, asr_elapsed):
+    def _process_text(text, asr_elapsed, force=False):
         # 本地補丁（2026-10-24 修二）：從 _emit_stable_delta 抽出的過濾+切分+送出段，
         # 讓逾時沖出的碎片也走完整過濾鏈（echo/幻覺/去重），不繞過防護
+        # 修五：force=True（逾時沖出）必須直接送出——否則 <3 詞判定又把它塞回
+        # 碎片緩衝，與逾時沖出互踢死循環（5.5 分鐘馬拉松積壓的根因）
         for _leak in _PROMPT_LEAK_TEXTS:
             text = text.replace(_leak, "")
         # 靜音 context echo 過濾（同分塊引擎）
@@ -6624,7 +6627,8 @@ def run_stream_qwen3_streaming(capture_id: int, translator, mode: str = "en2zh",
         # 會永遠進不了送出條件（句尾才判斷），碎片無限積壓＝日文場靜默假死。
         # 改為：句中已含句讀 → 切出前段完整句送出，只留無句讀的尾巴暫存
         _has_inner_stop = bool(re.search(r"[.!?。！？]", text[:-1]))
-        if _word_count < 3 and not _ends_sentence and not _has_inner_stop:
+        if (not force and _word_count < 3
+                and not _ends_sentence and not _has_inner_stop):
             # 本地補丁（2026-10-24 修二）：附加而非覆寫——連續碎片會互相蓋掉，
             # 且 stable 不再增長時無人來合併＝永久積壓（第二次日文場假死根因）
             _frag_buf[0] = ((_frag_buf[0] + " " + text).strip()
@@ -6680,15 +6684,10 @@ def run_stream_qwen3_streaming(capture_id: int, translator, mode: str = "en2zh",
                 return
             _last_reset_t[0] = _now
             print(f"{C_DIM}  [串流] 偵測到重複死循環，重置辨識上下文{RESET}", flush=True)
-            try:
-                state = _q3_streaming.init_streaming(
-                    model=_rt_model, language=q_lang,
-                    context=meeting_topic or "",
-                    chunk_size_sec=2.0,
-                    endpointing_mode="energy",
-                    finalization_mode="latency")
-            except Exception:
-                pass
+            # 本地補丁（2026-10-24 修四）：此函式（_process_text）無 nonlocal state，
+            # 直接賦值只會寫到區域副本（前幾場「重置永遠不生效」的根因）——
+            # 改設標誌，由握有 nonlocal 的 _emit_stable_delta / worker 執行重置
+            _need_reset[0] = True
             # 本地補丁（2026-10-23 修）：重置後 stable_text 從零開始，
             # _emitted/_frag_buf 未清空會壓制所有後續輸出（引擎假死）
             _emitted[0] = ""
@@ -6784,6 +6783,25 @@ def run_stream_qwen3_streaming(capture_id: int, translator, mode: str = "en2zh",
             # 例外都會無聲殺死它（音訊繼續收、永遠沒人處理＝假死）。
             # 改為捕捉後重置串流狀態續跑。
             try:
+                # 本地補丁（2026-10-24 修四）：執行 _process_text 請求的重置
+                # （worker 持有 nonlocal state，重置在這裡才真正生效）
+                if _need_reset[0]:
+                    _need_reset[0] = False
+                    try:
+                        state = _q3_streaming.init_streaming(
+                            model=_rt_model, language=q_lang,
+                            context=meeting_topic or "",
+                            chunk_size_sec=2.0,
+                            max_context_sec=12.0,
+                            endpointing_mode="energy",
+                            finalization_mode="latency")
+                    except Exception:
+                        pass
+                    _emitted[0] = ""
+                    _frag_buf[0] = ""
+                    _frag_last_t[0] = 0.0
+                    _recent_lines.clear()
+                    continue
                 if len(chunk) < 400:
                     _spk_win.extend(chunk.tolist() if hasattr(chunk, "tolist") else chunk)
                     continue
@@ -6816,7 +6834,7 @@ def run_stream_qwen3_streaming(capture_id: int, translator, mode: str = "en2zh",
                     _frag, _frag_buf[0] = _frag_buf[0], ""
                     _frag_last_t[0] = 0.0
                     if _frag.strip("，。、 "):
-                        _process_text(_frag, 0.0)
+                        _process_text(_frag, 0.0, force=True)
             except Exception as _feed_err:
                 print(f"{C_DIM}  [串流] 饋入異常，重置串流狀態: {_feed_err}{RESET}",
                       flush=True)
