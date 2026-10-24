@@ -6612,7 +6612,12 @@ def run_stream_qwen3_streaming(capture_id: int, translator, mode: str = "en2zh",
         # （翻譯模型對無意義短片段會輸出 prompt 規則文字）
         _word_count = len(re.findall(r"[A-Za-z0-9\u4e00-\u9fff]+", text))
         _ends_sentence = bool(re.search(r"[.!?。！？]$", text))
-        if _word_count < 3 and not _ends_sentence:
+        # 本地補丁（2026-10-24 修）：日文/中文無空格，詞數 regex 對連續漢字
+        # 只算一大團——「気ですね」這種 3 字定稿若以句中句號切開、尾巴無句號，
+        # 會永遠進不了送出條件（句尾才判斷），碎片無限積壓＝日文場靜默假死。
+        # 改為：句中已含句讀 → 切出前段完整句送出，只留無句讀的尾巴暫存
+        _has_inner_stop = bool(re.search(r"[.!?。！？]", text[:-1]))
+        if _word_count < 3 and not _ends_sentence and not _has_inner_stop:
             _frag_buf[0] = text
             return
         # 重複修剪：串流定稿的重疊重述以句子級去重（標點正規化後 containment 比對）
@@ -6974,7 +6979,10 @@ def run_stream_nemotron_streaming(capture_id: int, translator, mode: str = "en2z
             return
         _word_count = len(re.findall(r"[A-Za-z0-9\u4e00-\u9fff]+", text))
         _ends_sentence = bool(re.search(r"[.!?。！？]$", text))
-        if _word_count < 3 and not _ends_sentence:
+        # 本地補丁（2026-10-24 修）：同 qwen3 引擎——句中已含句讀的短定稿
+        # 必須放行切分，否則中日文碎片永遠積壓在緩衝裡
+        _has_inner_stop = bool(re.search(r"[.!?。！？]", text[:-1]))
+        if _word_count < 3 and not _ends_sentence and not _has_inner_stop:
             _frag_buf[0] = text
             return
         if _frag_buf[0]:
